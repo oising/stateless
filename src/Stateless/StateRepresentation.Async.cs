@@ -1,6 +1,9 @@
 #if TASKS
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Stateless
@@ -19,12 +22,21 @@ namespace Stateless
                 DeactivateActions.Add(new DeactivateActionBehaviour.Async(_state, action, deactivateActionDescription));
             }
 
+            public void AddEntryAction(Func<Transition, object[], Task> action, Reflection.InvocationInfo entryActionDescription)
+            {
+                if (action == null) throw new ArgumentNullException(nameof(action));
+
+                EntryActions.Add(
+                    new EntryActionBehavior.Async((t, args, _) => action(t, args),
+                    entryActionDescription));
+            }
+
             public void AddEntryAction(TTrigger trigger, Func<Transition, object[], Task> action, Reflection.InvocationInfo entryActionDescription)
             {
                 if (action == null) throw new ArgumentNullException(nameof(action));
 
                 EntryActions.Add(
-                    new EntryActionBehavior.Async((t, args) =>
+                    new EntryActionBehavior.Async((t, args, _) =>
                     {
                         if (t.Trigger.Equals(trigger))
                             return action(t, args);
@@ -34,7 +46,22 @@ namespace Stateless
                     entryActionDescription));
             }
 
-            public void AddEntryAction(Func<Transition, object[], Task> action, Reflection.InvocationInfo entryActionDescription)
+            public void AddEntryAction(TTrigger trigger, Func<Transition, object[], CancellationToken, Task> action, Reflection.InvocationInfo entryActionDescription)
+            {
+                if (action == null) throw new ArgumentNullException(nameof(action));
+
+                EntryActions.Add(
+                    new EntryActionBehavior.Async((t, args, ct) =>
+                        {
+                            if (t.Trigger.Equals(trigger))
+                                return action(t, args, ct);
+
+                            return TaskResult.Done;
+                        },
+                        entryActionDescription));
+            }
+
+            public void AddEntryAction(Func<Transition, object[], CancellationToken, Task> action, Reflection.InvocationInfo entryActionDescription)
             {
                 EntryActions.Add(
                     new EntryActionBehavior.Async(
@@ -75,18 +102,20 @@ namespace Stateless
                     await action.ExecuteAsync().ConfigureAwait(false);
             }
 
-            public async Task EnterAsync(Transition transition, params object[] entryArgs)
+            public async Task EnterAsync(Transition transition, CancellationToken ct, params object[] entryArgs)
             {
                 if (transition.IsReentry)
                 {
-                    await ExecuteEntryActionsAsync(transition, entryArgs).ConfigureAwait(false);
+                    await ExecuteEntryActionsAsync(transition, entryArgs, ct).ConfigureAwait(false);
+                    await ExecuteActivationActionsAsync().ConfigureAwait(false);
                 }
                 else if (!Includes(transition.Source))
                 {
-                    if (_superstate != null && !(transition is InitialTransition))
-                        await _superstate.EnterAsync(transition, entryArgs).ConfigureAwait(false);
+                    if (_superstate != null)
+                        await _superstate.EnterAsync(transition, ct, entryArgs).ConfigureAwait(false);
 
-                    await ExecuteEntryActionsAsync(transition, entryArgs).ConfigureAwait(false);
+                    await ExecuteEntryActionsAsync(transition, entryArgs, ct).ConfigureAwait(false);
+                    await ExecuteActivationActionsAsync().ConfigureAwait(false);
                 }
             }
 
@@ -120,10 +149,10 @@ namespace Stateless
                 return transition;
             }
 
-            async Task ExecuteEntryActionsAsync(Transition transition, object[] entryArgs)
+            async Task ExecuteEntryActionsAsync(Transition transition, object[] entryArgs, CancellationToken ct)
             {
                 foreach (var action in EntryActions)
-                    await action.ExecuteAsync(transition, entryArgs).ConfigureAwait(false);
+                    await action.ExecuteAsync(transition, entryArgs, ct).ConfigureAwait(false);
             }
 
             async Task ExecuteExitActionsAsync(Transition transition)
@@ -158,6 +187,57 @@ namespace Stateless
             internal Task InternalActionAsync(Transition transition, object[] args)
             {
                 return ExecuteInternalActionsAsync(transition, args);
+            }
+
+            public async Task<Tuple<bool, TriggerBehaviourResult>> TryFindHandlerAsync(TTrigger trigger, object[] args)
+            {
+                // Look for local handler.
+                var searchResult = await TryFindLocalHandlerAsync(trigger, args);
+                if (searchResult.Item1)
+                {
+                    return Tuple.Create(true, searchResult.Item2);
+                }
+
+                // Check super state.
+                if (Superstate == null)
+                {
+                    return Tuple.Create(false, (TriggerBehaviourResult) null);
+                }
+
+                searchResult = await Superstate.TryFindHandlerAsync(trigger, args);
+                if (searchResult.Item1)
+                {
+                    return Tuple.Create(true, searchResult.Item2);
+                }
+
+                return Tuple.Create(false, (TriggerBehaviourResult) null);
+            }
+
+            async Task<Tuple<bool, TriggerBehaviourResult>> TryFindLocalHandlerAsync(TTrigger trigger, object[] args)
+            {
+                // Get list of candidate trigger handlers
+                if (!TriggerBehaviours.TryGetValue(trigger, out ICollection<TriggerBehaviour> possible))
+                {
+                    return Tuple.Create(false, (TriggerBehaviourResult) null);
+                }
+
+                // Remove those that have unmet guard conditions
+                // Guard functions are executed here
+                var triggerBehaviourResultTasks = possible
+                    .Select(async h => new TriggerBehaviourResult(h, await h.UnmetGuardConditionsAsync(args)));
+                var triggerBehaviourResults = await Task.WhenAll(triggerBehaviourResultTasks);
+
+                var actual = triggerBehaviourResults
+                    .Where(g => g.UnmetGuardConditions.Count == 0)
+                    .ToArray();
+
+                // Find a handler for the trigger
+                var handlerResult = TryFindLocalHandlerResult(trigger, actual)
+                                ?? TryFindLocalHandlerResult(trigger, actual);
+
+                if (handlerResult == null) return Tuple.Create(false, (TriggerBehaviourResult) null);
+
+                return Tuple.Create(!handlerResult.UnmetGuardConditions.Any(), handlerResult);
             }
         }
     }

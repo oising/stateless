@@ -255,7 +255,7 @@ namespace Stateless.Tests
             bool onExitStateAfired = false;
 
             sm.Configure(State.B)
-                .OnEntryAsync(t => Task.Run(() => onEntryStateBfired = true))
+                .OnEntryAsync((Func<StateMachine<State, Trigger>.Transition, Task>) (t => Task.Run(() => onEntryStateBfired = true)))
                 .PermitReentry(Trigger.X)
                 .OnExitAsync(t => Task.Run(() => onExitStateBfired = true));
 
